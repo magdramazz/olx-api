@@ -13,9 +13,7 @@ type Config struct {
 }
 
 func MustLoad() *Config {
-	if err := godotenv.Load(); err != nil {
-		panic("Error loading .env file")
-	}
+	godotenv.Load()
 
 	port := os.Getenv("PORT")
 	if port == "" {
