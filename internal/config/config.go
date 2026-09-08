@@ -7,12 +7,15 @@ import (
 )
 
 type Config struct {
-	Port string
-	Env  string
+	Port        string
+	Env         string
+	DatabaseUrl string
 }
 
 func MustLoad() *Config {
-	godotenv.Load()
+	if err := godotenv.Load(); err != nil {
+		panic("Error loading .env file")
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -23,10 +26,15 @@ func MustLoad() *Config {
 	if env == "" {
 		panic("ENV environment variable is not set")
 	}
+	dbUrl := os.Getenv("DATABASE_URL")
+	if dbUrl == "" {
+		panic("DATABASE_URL environment variable is not set")
+	}
 
 	return &Config{
-		Port: port,
-		Env:  env,
+		Port:        port,
+		Env:         env,
+		DatabaseUrl: dbUrl,
 	}
 
 }
