@@ -1,2 +1,2 @@
 ### GET request to example server
-GET localhost:8080/health
+GET localhost:8089/healthw
