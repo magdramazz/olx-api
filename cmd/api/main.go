@@ -7,19 +7,21 @@ import (
 	"time"
 
 	"github.com/magdramazz/olx-api/internal/config"
-	"github.com/magdramazz/olx-api/internal/db"
+	database "github.com/magdramazz/olx-api/internal/db"
 	"github.com/magdramazz/olx-api/internal/handlers"
 )
 
 func main() {
 	cfg := config.MustLoad()
-	if _, err := db.Connect(cfg.DatabaseUrl); err != nil {
+	db, err := database.Connect(cfg.DatabaseUrl)
+	if err != nil {
 		log.Fatalf("Error connecting to database: %v", err)
 	}
 	fmt.Println("Connected to database")
 	fmt.Printf("starting olx sever...")
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handlers.Health)
+	mux.HandleFunc("GET /listings", handlers.List(db))
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -31,7 +33,7 @@ func main() {
 
 	log.Printf("olx api server is listening on port %s", srv.Addr)
 
-	err := srv.ListenAndServe()
+	err = srv.ListenAndServe()
 	if err != nil {
 		log.Fatalf(" server failed:%v", err)
 	}
