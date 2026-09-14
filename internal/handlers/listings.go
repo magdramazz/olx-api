@@ -6,11 +6,16 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/magdramazz/olx-api/internal/httpx"
 	"github.com/magdramazz/olx-api/internal/middleware"
 )
+
+const maxBodyBytes = 1 << 20
 
 type listing struct {
 	ID          string    `json:"id"`
@@ -34,21 +39,18 @@ func NewListHandler(db *sql.DB, logger *slog.Logger) *ListingHandler {
 }
 func (lh ListingHandler) List(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rows, err := lh.db.QueryContext(ctx, "SELECT * FROM listings ORDER BY created_at DESC LIMIT 100")
+	rows, err := lh.db.QueryContext(ctx, "SELECT id, title, description, price, city, created_at FROM listings ORDER BY created_at DESC LIMIT 100")
 	if err != nil {
 		log.Printf("query error: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	defer func(rows *sql.Rows) {
-		err := rows.Close()
-		if err != nil {
+	defer func() {
+		if err := rows.Close(); err != nil {
 			log.Printf("rows.close error: %v", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
 		}
-	}(rows)
-	var listings []listing
+	}()
+	listings := make([]listing, 0)
 	for rows.Next() {
 		var list listing
 		if err := rows.Scan(&list.ID, &list.Title, &list.Description, &list.Price, &list.City, &list.CreatedAt); err != nil {
@@ -65,11 +67,8 @@ func (lh ListingHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	err = json.NewEncoder(w).Encode(listings)
-	if err != nil {
+	if err := json.NewEncoder(w).Encode(listings); err != nil {
 		log.Printf("json.encode error: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -77,33 +76,78 @@ func (lh ListingHandler) Create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	requestId := middleware.RequestIdFromContext(ctx)
 	var req listing
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&req); err != nil {
 		lh.logger.Error("failed to decode request body", "err", err, "request_id", requestId)
-		httpx.Error(w, http.StatusBadRequest, "invalid request body", httpx.CodeInvalidID)
+		httpx.Error(w, http.StatusBadRequest, "invalid request body", httpx.CodeInvalidBody)
 		return
 	}
-	row := lh.db.QueryRowContext(ctx, "INSERT INTO listings (id, title, description, price, city) VALUES ($1, $2, $3, $4, $5)", req.ID, req.Title, req.Description, req.Price, req.City)
-	if err := row.Scan(); err != nil {
+	price, problem := req.validate()
+	if problem != "" {
+		httpx.Error(w, http.StatusBadRequest, problem, httpx.CodeValidationError)
+		return
+	}
+	// id and created_at come from the database defaults, never from the client.
+	err := lh.db.QueryRowContext(ctx,
+		"INSERT INTO listings (title, description, price, city) VALUES ($1, $2, $3, $4) RETURNING id, created_at",
+		req.Title, req.Description, price, req.City,
+	).Scan(&req.ID, &req.CreatedAt)
+	if err != nil {
 		lh.logger.Error("failed to insert listing", "err", err, "request_id", requestId)
 		httpx.Error(w, http.StatusInternalServerError, "failed to insert listing", httpx.CodeInternalError)
 		return
 	}
-	lh.logger.Info("listing created", "request_id", requestId)
+	req.Price = strconv.FormatInt(price, 10)
+	lh.logger.Info("listing created", "listing_id", req.ID, "request_id", requestId)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{"id": req.ID})
-	w.Write([]byte("{ok}"))
+	if err := json.NewEncoder(w).Encode(req); err != nil {
+		lh.logger.Error("failed to encode response", "err", err, "request_id", requestId)
+	}
+}
+
+// validate trims the client-supplied fields and returns the parsed price, or a
+// message describing the first invalid field.
+func (l *listing) validate() (int64, string) {
+	l.Title = strings.TrimSpace(l.Title)
+	l.Description = strings.TrimSpace(l.Description)
+	l.City = strings.TrimSpace(l.City)
+	switch {
+	case l.Title == "":
+		return 0, "title is required"
+	case l.Description == "":
+		return 0, "description is required"
+	case l.City == "":
+		return 0, "city is required"
+	}
+	price, err := strconv.ParseInt(strings.TrimSpace(l.Price), 10, 64)
+	if err != nil || price < 0 {
+		return 0, "price must be a non-negative integer"
+	}
+	return price, ""
 }
 
 func (lh ListingHandler) DeleteListing(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	ctx := r.Context()
 	requestId := middleware.RequestIdFromContext(ctx)
-	_, err := lh.db.ExecContext(ctx, "DELETE FROM listings WHERE id = $1", id)
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, "listing id must be a UUID", httpx.CodeInvalidID)
+		return
+	}
+	res, err := lh.db.ExecContext(ctx, "DELETE FROM listings WHERE id = $1", id.String())
 	if err != nil {
 		slog.Error("delete failed", "listing_id", id, "err", err, "request_id", requestId)
-		//http.Error(w, "internal error", http.StatusInternalServerError)
 		httpx.Error(w, http.StatusInternalServerError, "something went wrong", httpx.CodeInternalError)
+		return
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		slog.Error("delete rows affected failed", "listing_id", id, "err", err, "request_id", requestId)
+		httpx.Error(w, http.StatusInternalServerError, "something went wrong", httpx.CodeInternalError)
+		return
+	}
+	if deleted == 0 {
+		httpx.Error(w, http.StatusNotFound, "listing not found", httpx.CodeNotFound)
 		return
 	}
 
